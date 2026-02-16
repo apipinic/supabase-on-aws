@@ -17,6 +17,6 @@ const app = new App();
 
 new SupabaseWafStack(app, 'SupabaseWaf', { env: { region: 'us-east-1' } });
 
-new SupabaseStack(app, 'Supabase', { env, synthesizer });
+new SupabaseStack(app, 'Supabase-AiAssist', { env, synthesizer });
 
 app.synth();

@@ -1,13 +1,13 @@
-import * as path from 'path';
+
 import * as amplify from '@aws-cdk/aws-amplify-alpha';
 import * as cdk from 'aws-cdk-lib';
 import { BuildSpec } from 'aws-cdk-lib/aws-codebuild';
-import * as codecommit from 'aws-cdk-lib/aws-codecommit';
+import { Secret } from 'aws-cdk-lib/aws-secretsmanager';
 import * as iam from 'aws-cdk-lib/aws-iam';
-import * as lambda from 'aws-cdk-lib/aws-lambda';
+
 import { ISecret } from 'aws-cdk-lib/aws-secretsmanager';
 import { StringParameter } from 'aws-cdk-lib/aws-ssm';
-import * as cr from 'aws-cdk-lib/custom-resources';
+
 import { Construct } from 'constructs';
 
 interface SupabaseStudioProps {
@@ -32,19 +32,28 @@ export class SupabaseStudio extends Construct {
     super(scope, id);
 
     const buildImage = 'public.ecr.aws/sam/build-nodejs18.x:latest';
-    const sourceRepo = 'https://github.com/supabase/supabase.git';
-    const sourceBranch = props.sourceBranch ?? 'master';
-    const appRoot = props.appRoot ?? 'studio';
+    const sourceRepo = 'https://github.com/apipinic/supabase.git';
+    const sourceBranch = props.sourceBranch ?? 'main';
+    const appRoot = props.appRoot ?? 'apps/studio';
     const { supabaseUrl, dbSecret, anonKey, serviceRoleKey } = props;
 
-    /** CodeCommit - Source Repository for Amplify Hosting */
+    /** CodeCommit - Source Repository for Amplify Hosting 
     const repository = new Repository(this, 'Repository', {
       repositoryName: cdk.Aws.STACK_NAME,
       description: `${this.node.path}/Repository`,
-    });
+    });*/
 
     /** Import from GitHub to CodeComit */
-    const repoImportJob = repository.importFromUrl(sourceRepo, sourceBranch);
+    /** const repoImportJob = repository.importFromUrl(sourceRepo, sourceBranch); */
+
+    /** GitHub - Source Repository for Amplify Hosting (no CodeCommit, no import Lambda) */
+   const githubToken = Secret.fromSecretNameV2(this, 'GitHubToken', 'supabase2/github-token');
+
+  const githubProvider = new amplify.GitHubSourceCodeProvider({
+    owner: 'apipinic',
+    repository: 'supabase',
+    oauthToken: githubToken.secretValue,
+  });
 
     /** IAM Role for SSR app logging */
     const role = new iam.Role(this, 'Role', {
@@ -87,9 +96,10 @@ export class SupabaseStudio extends Construct {
             postBuild: {
               commands: [
                 `cd ${appRoot}`,
-                `rsync -av --ignore-existing .next/standalone/${repository.repositoryName}/${appRoot}/ .next/standalone/`,
-                `rsync -av --ignore-existing .next/standalone/${repository.repositoryName}/node_modules/ .next/standalone/node_modules/`,
-                `rm -rf .next/standalone/${repository.repositoryName}`,
+                'REPO_DIR=$(ls -1 .next/standalone | head -n 1)',
+                `rsync -av --ignore-existing .next/standalone/$REPO_DIR/${appRoot}/ .next/standalone/`,
+                'rsync -av --ignore-existing .next/standalone/$REPO_DIR/node_modules/ .next/standalone/node_modules/',
+                'rm -rf .next/standalone/$REPO_DIR',
                 'cp .env .env.production .next/standalone/',
                 // https://nextjs.org/docs/advanced-features/output-file-tracing#automatically-copying-traced-files
                 'rsync -av --ignore-existing public/ .next/standalone/public/',
@@ -113,7 +123,7 @@ export class SupabaseStudio extends Construct {
     this.app = new amplify.App(this, 'App', {
       appName: this.node.path.replace(/\//g, ''),
       role,
-      sourceCodeProvider: new amplify.CodeCommitSourceCodeProvider({ repository }),
+      sourceCodeProvider: githubProvider,
       buildSpec,
       environmentVariables: {
         // for Amplify Hosting Build
@@ -148,8 +158,6 @@ export class SupabaseStudio extends Construct {
     });
     (this.prodBranch.node.defaultChild as cdk.CfnResource).addPropertyOverride('Framework', 'Next.js - SSR');
 
-    repoImportJob.node.addDependency(this.prodBranch.node.defaultChild!);
-
     /** IAM Policy for SSR app logging */
     const amplifySSRLoggingPolicy = new iam.Policy(this, 'AmplifySSRLoggingPolicy', {
       policyName: `AmplifySSRLoggingPolicy-${this.app.appId}`,
@@ -174,64 +182,5 @@ export class SupabaseStudio extends Construct {
     amplifySSRLoggingPolicy.attachToRole(role);
 
     this.prodBranchUrl = `https://${this.prodBranch.branchName}.${this.app.defaultDomain}`;
-  }
-
-}
-
-export class Repository extends codecommit.Repository {
-  readonly importFunction: lambda.Function;
-  readonly importProvider: cr.Provider;
-
-  /** CodeCommit to sync with GitHub */
-  constructor(scope: Construct, id: string, props: codecommit.RepositoryProps) {
-    super(scope, id, props);
-
-    this.importFunction = new lambda.Function(this, 'ImportFunction', {
-      description: 'Clone to CodeCommit from remote repo (You can execute this function manually.)',
-      runtime: lambda.Runtime.PYTHON_3_12,
-      code: lambda.Code.fromAsset(path.resolve(__dirname, 'cr-import-repo'), {
-        bundling: {
-          image: cdk.DockerImage.fromRegistry('public.ecr.aws/sam/build-python3.12:latest-x86_64'),
-          command: [
-            '/bin/bash', '-c', [
-              'mkdir -p /var/task/local/{bin,lib}',
-              'cp /usr/bin/git /usr/libexec/git-core/git-remote-https /usr/libexec/git-core/git-remote-http /var/task/local/bin',
-              'ldd /usr/bin/git | awk \'NF == 4 { system("cp " $3 " /var/task/local/lib/") }\'',
-              'ldd /usr/libexec/git-core/git-remote-https | awk \'NF == 4 { system("cp " $3 " /var/task/local/lib/") }\'',
-              'ldd /usr/libexec/git-core/git-remote-http | awk \'NF == 4 { system("cp " $3 " /var/task/local/lib/") }\'',
-              'pip install -r requirements.txt -t /var/task',
-              'cp -au /asset-input/index.py /var/task',
-              'cp -aur /var/task/* /asset-output',
-            ].join('&&'),
-          ],
-          user: 'root',
-        },
-      }),
-      handler: 'index.handler',
-      memorySize: 4096,
-      ephemeralStorageSize: cdk.Size.gibibytes(3),
-      timeout: cdk.Duration.minutes(15),
-      environment: {
-        TARGET_REPO: this.repositoryCloneUrlGrc,
-      },
-    });
-    this.grantPullPush(this.importFunction);
-
-    this.importProvider = new cr.Provider(this, 'ImportProvider', { onEventHandler: this.importFunction });
-  }
-
-  importFromUrl(sourceRepoUrlHttp: string, sourceBranch: string, targetBranch: string = 'main') {
-    this.importFunction.addEnvironment('SOURCE_REPO', sourceRepoUrlHttp);
-    this.importFunction.addEnvironment('SOURCE_BRANCH', sourceBranch);
-    this.importFunction.addEnvironment('TARGET_BRANCH', targetBranch);
-
-    return new cdk.CustomResource(this, targetBranch, {
-      resourceType: 'Custom::RepoImportJob',
-      serviceToken: this.importProvider.serviceToken,
-      properties: {
-        SourceRepo: sourceRepoUrlHttp,
-        SourceBranch: sourceBranch,
-      },
-    });
   }
 }
